@@ -103,6 +103,9 @@ pub(crate) fn smt_add_decl<'ctx>(context: &mut Context, decl: &Decl) {
             let mut infos: Vec<AssertionInfo> = Vec::new();
             let mut axiom_infos: Vec<AxiomInfo> = Vec::new();
             let labeled_expr = label_asserts(context, &mut infos, &mut axiom_infos, &expr);
+            if let Some(obs) = &context.air_observer {
+                obs.borrow_mut().on_axiom_decl(&labeled_expr);
+            }
             for info in axiom_infos {
                 crate::typecheck::add_decl(context, &info.decl, true).unwrap();
                 context
@@ -324,6 +327,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
             match reason.expect("expected :reason-unknown") {
                 SmtReasonUnknown::Canceled | SmtReasonUnknown::Unknown => {
                     context.state = ContextState::Canceled;
+                    // Notify observer of timeout/cancellation
+                    if let Some(obs) = &context.query_result_observer {
+                        obs.borrow_mut().on_check_valid_result(
+                            &mut crate::query_result_observer::CheckValidResult::Timeout { assert_id: &None },
+                        );
+                    }
                     ResultDetermination::Determined(ValidityResult::Canceled)
                 }
                 SmtReasonUnknown::Incomplete => ResultDetermination::Undetermined(false),
@@ -359,6 +368,12 @@ pub(crate) fn smt_check_assertion<'ctx>(
             } else {
                 crate::context::UsageInfo::None
             };
+
+            if let Some(obs) = &context.query_result_observer {
+                obs.borrow_mut().on_check_valid_result(
+                    &mut crate::query_result_observer::CheckValidResult::Valid,
+                );
+            }
 
             ValidityResult::Valid(usage_info)
         }
@@ -445,17 +460,22 @@ fn smt_get_model(
     for def in model.iter() {
         model_defs.insert(def.name.clone(), def.clone());
     }
-    for info in infos.iter_mut() {
+    // Observer contract (Phases 1–3): the `QueryResultObserver::Invalid` callback
+    // exposes a *live* model evaluator (`eval_bool_expr`), so the Z3 model must
+    // stay valid across the callback. We therefore split what would otherwise be
+    // one step into: Phase 1 discover the failing assertion (without disabling its
+    // label), Phase 2 notify the observer (model still live), Phase 3 disable the
+    // label (invalidating the model) for subsequent check-sats. This structure is
+    // behavior-preserving when no observer is registered (Phase 3 still runs).
+    //
+    // Phase 1: Discover the failing assertion without disabling the label.
+    let mut discovered_info_index: Option<usize> = None;
+    for (i, info) in infos.iter().enumerate() {
         if let Some(def) = model_defs.get(&info.label) {
             if *def.body == "true" {
                 discovered_error = Some(info.clone());
                 discovered_assert_id = Some(info.assert_id.clone());
-
-                // Disable this label in subsequent check-sat calls to get additional errors
-                info.disabled = true;
-                let disable_label = mk_not(&ident_var(&info.label));
-                context.smt_log.log_assert(&None, &disable_label);
-
+                discovered_info_index = Some(i);
                 break;
             }
         }
@@ -489,6 +509,29 @@ fn smt_get_model(
 
     let error = discovered_error.error;
     let e = context.message_interface.append_labels(&error, &discovered_additional_info);
+
+    // Phase 2: Notify observer while the Z3 model is still valid.
+    // eval_expr calls context.evaluate_bool() which sends (eval ...) to Z3.
+    // This only works before the label is disabled (which invalidates the model).
+    // Clone the shared handle so `context` stays free for the eval_bool_expr closure.
+    let obs = context.query_result_observer.clone();
+    if let Some(obs) = &obs {
+        let assert_id = discovered_assert_id.clone().unwrap();
+        obs.borrow_mut().on_check_valid_result(&mut crate::query_result_observer::CheckValidResult::Invalid {
+            model_defs: &model_defs,
+            eval_bool_expr: &mut |expr| context.evaluate_bool(expr),
+            assert_id: &assert_id,
+            error: &e,
+        });
+    }
+
+    // Phase 3: Disable the label for subsequent check-sat calls.
+    if let Some(idx) = discovered_info_index {
+        infos[idx].disabled = true;
+        let disable_label = mk_not(&ident_var(&infos[idx].label));
+        context.smt_log.log_assert(&None, &disable_label);
+    }
+
     context.state = ContextState::FoundInvalid(infos, Some(air_model.clone()));
     ValidityResult::Invalid(Some(air_model), Some(e), discovered_assert_id.unwrap())
 }

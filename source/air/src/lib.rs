@@ -5,6 +5,8 @@ pub mod emitter;
 pub mod focus;
 pub mod messages;
 pub mod model;
+pub mod air_observer;
+pub mod query_result_observer;
 pub mod parser;
 pub mod profiler;
 pub mod remove_asserts;
@@ -14,7 +16,7 @@ pub mod smt_process;
 #[macro_use]
 pub mod printer;
 
-mod block_to_assert;
+pub mod block_to_assert;
 mod closure;
 mod def;
 mod smt_verify;
