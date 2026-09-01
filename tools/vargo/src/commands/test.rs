@@ -53,7 +53,10 @@ pub fn test(
     context: &VargoContext,
     vargo_cmd: &VargoTest,
 ) -> anyhow::Result<()> {
-    if vargo_cmd.package != "air" && vargo_cmd.package != "rust_verify_test" {
+    if vargo_cmd.package != "air"
+        && vargo_cmd.package != "air_lift"
+        && vargo_cmd.package != "rust_verify_test"
+    {
         anyhow::bail!("unexpected package for `vargo test`: {}", vargo_cmd.package);
     }
 

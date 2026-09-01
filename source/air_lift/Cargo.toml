@@ -1,0 +1,15 @@
+[package]
+name = "air_lift"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+air = { path = "../air" }
+vir = { path = "../vir" }
+tracing = "0.1"
+indexmap = { version = "1" }
+sha2 = "0.10"
+num-bigint = "0.4"
+verus_syn = { version = "=0.0.0-2026-08-02-0125", path = "../../dependencies/syn", features = ["full", "extra-traits"] }
+proc-macro2 = "1"
+quote = "1"

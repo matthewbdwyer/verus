@@ -67,6 +67,18 @@ fn create_observer(name: &str) -> vir::vir_observer::Observers {
             let vir: Rc<RefCell<dyn vir::vir_observer::VirObserver>> = o;
             vir::vir_observer::Observers { vir: Some(vir), ..Default::default() }
         }
+        "airlift-probe" => {
+            let o = Rc::new(RefCell::new(crate::test_observer::AirLiftProbe::new()));
+            let vir: Rc<RefCell<dyn vir::vir_observer::VirObserver>> = o.clone();
+            let air: Rc<RefCell<dyn air::air_observer::AirObserver>> = o.clone();
+            let query_result: Rc<RefCell<dyn air::query_result_observer::QueryResultObserver>> =
+                o.clone();
+            vir::vir_observer::Observers {
+                vir: Some(vir),
+                air: Some(air),
+                query_result: Some(query_result),
+            }
+        }
         _ => vir::vir_observer::Observers::default(),
     }
 }
@@ -89,6 +101,8 @@ fn emit_observer_summaries(
     } else if let Some(o) = any.downcast_ref::<crate::test_observer::QueryResultOnlyObserver>() {
         reporter.report(&note_bare(&o.summary_json()).to_any());
     } else if let Some(o) = any.downcast_ref::<crate::test_observer::VirOnlyObserver>() {
+        reporter.report(&note_bare(&o.summary_json()).to_any());
+    } else if let Some(o) = any.downcast_ref::<crate::test_observer::AirLiftProbe>() {
         reporter.report(&note_bare(&o.summary_json()).to_any());
     }
 }

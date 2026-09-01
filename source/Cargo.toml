@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "air",
+  "air_lift",
   "builtin",
   "builtin_macros",
   "cargo-verus",
@@ -85,6 +86,7 @@ zip = "8.6"
 
 # internal dependencies
 air = { path = "air" }
+air_lift = { path = "air_lift" }
 cargo-verus-toolchains = { path = "cargo-verus-toolchains" }
 internals_interface = { path = "tools/internals_interface" }
 rustc_mir_build_verus = { path = "rustc_mir_build", package = "rustc_mir_build" }

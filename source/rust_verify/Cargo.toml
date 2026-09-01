@@ -7,6 +7,8 @@ edition = "2024"
 
 [dependencies]
 air = { workspace = true }
+# Consumed by the AirLiftProbe test observer in this crate.
+air_lift = { workspace = true }
 bincode-next = { workspace = true }
 cargo-verus-toolchains = { workspace = true }
 console = { workspace = true }

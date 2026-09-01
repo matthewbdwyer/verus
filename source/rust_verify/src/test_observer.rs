@@ -440,3 +440,190 @@ impl vir::vir_observer::VirObserver for VirOnlyObserver {
     fn as_any(&self) -> &dyn Any { self }
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 }
+
+// ---------------------------------------------------------------------------
+// AirLiftProbe — the end-to-end test harness for the `air_lift` crate.
+//
+// Embeds an `air_lift::accumulate::AirLift`, delegates the AIR/VIR observer
+// callbacks to it (so AirLift accumulates the lowering context), and implements
+// QueryResultObserver: on `Invalid` it locates the failing assertion's AIR
+// expression, lifts it (`lift_expr`) using AirLift's accumulated context, renders
+// it (`air_lift::render`), and records the source-level goal. `summary_json`
+// emits the rendered goals as an `AIRLIFT:{...}` note for e2e assertions.
+//
+// A client of air_lift: it embeds an `AirLift` and consumes its lifting API, which is
+// what the rust_verify -> air_lift dependency exists for.
+// ---------------------------------------------------------------------------
+
+/// Recursively collect `(assert_id, goal_expr)` pairs from an AIR statement.
+fn collect_asserts(
+    stmt: &air::ast::Stmt,
+    out: &mut Vec<(Option<air::ast::AssertId>, air::ast::Expr)>,
+) {
+    match &**stmt {
+        air::ast::StmtX::Assert(id, _, _, e) => out.push((id.clone(), e.clone())),
+        air::ast::StmtX::Block(stmts) | air::ast::StmtX::Switch(stmts) => {
+            for s in stmts.iter() {
+                collect_asserts(s, out);
+            }
+        }
+        air::ast::StmtX::DeadEnd(s) | air::ast::StmtX::Breakable(_, s) => collect_asserts(s, out),
+        _ => {}
+    }
+}
+
+pub struct AirLiftProbe {
+    airlift: air_lift::accumulate::AirLift,
+    /// Rendered source-level goals, one per failed query.
+    goals: Vec<String>,
+    /// `to_syn` (injectable-AST) rendering of each goal, and whether it re-parses.
+    syn: Vec<String>,
+    syn_ok: bool,
+}
+
+impl AirLiftProbe {
+    pub fn new() -> Self {
+        AirLiftProbe {
+            airlift: air_lift::accumulate::AirLift::new(),
+            goals: vec![],
+            syn: vec![],
+            syn_ok: true,
+        }
+    }
+
+    /// Locate the failing assertion in the current query and lift it; return both the compact
+    /// `render` string and the `to_syn` (injectable-AST) string, so every e2e row also exercises
+    /// the `to_syn` path.
+    fn lift_failing_goal(&self, target: &Option<air::ast::AssertId>) -> Option<(String, String, bool)> {
+        let query = self.airlift.current_query()?;
+        let mut asserts = Vec::new();
+        collect_asserts(&query.assertion, &mut asserts);
+        // Prefer the assertion whose id matches the failing query; otherwise fall
+        // back to the last assertion (the goal is emitted last).
+        let expr = asserts
+            .iter()
+            .find(|(id, _)| id == target)
+            .map(|(_, e)| e.clone())
+            .or_else(|| asserts.last().map(|(_, e)| e.clone()))?;
+        // Normalization and classification both live in air_lift.
+        let lifted = self.airlift.lift(&expr);
+        let rendered = air_lift::render::render(&lifted);
+        let syn = air_lift::syn_bridge::to_syn_string(&lifted);
+        let syn_ok = air_lift::syn_bridge::to_syn_reparses(&lifted);
+        Some((rendered, syn, syn_ok))
+    }
+
+    pub fn summary_json(&self) -> String {
+        // {:?} on a String yields a JSON-safe quoted+escaped literal.
+        let items: Vec<String> = self.goals.iter().map(|g| format!("{:?}", g)).collect();
+        let syns: Vec<String> = self.syn.iter().map(|g| format!("{:?}", g)).collect();
+        format!(
+            "AIRLIFT:{{\"goals\":[{}],\"syn\":[{}],\"syn_ok\":{},\"defs\":{},\"tmp_defs\":{}}}",
+            items.join(","),
+            syns.join(","),
+            self.syn_ok,
+            self.airlift.definitions().len(),
+            self.airlift.current_tmp_defs().map(|d| d.len()).unwrap_or(0),
+        )
+    }
+}
+
+impl air::air_observer::AirObserver for AirLiftProbe {
+    fn on_query_lowered(&mut self, q: &air::ast::Query, s: &air::ast::Snapshots, d: &[air::ast::Decl]) {
+        self.airlift.on_query_lowered(q, s, d);
+    }
+    fn on_wp_version_created(&mut self, v: &air::ast::Ident, k: air::air_observer::VersionOrigin) {
+        self.airlift.on_wp_version_created(v, k);
+    }
+    fn on_lambda_decl(&mut self, n: &air::ast::Ident, p: &[air::ast::Ident], b: &air::ast::Expr) {
+        self.airlift.on_lambda_decl(n, p, b);
+    }
+    fn on_choose_decl(&mut self, n: &air::ast::Ident, b: &air::ast::Ident) {
+        self.airlift.on_choose_decl(n, b);
+    }
+    fn on_axiom_decl(&mut self, e: &air::ast::Expr) {
+        self.airlift.on_axiom_decl(e);
+    }
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+
+impl air::query_result_observer::QueryResultObserver for AirLiftProbe {
+    fn on_check_valid_result(&mut self, result: &mut air::query_result_observer::CheckValidResult) {
+        if let air::query_result_observer::CheckValidResult::Invalid { assert_id, .. } = result {
+            let target: Option<air::ast::AssertId> = (*assert_id).clone();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.lift_failing_goal(&target)
+            }));
+            match r {
+                Ok(Some((rendered, syn, ok))) => {
+                    self.goals.push(rendered);
+                    self.syn.push(syn);
+                    if !ok {
+                        self.syn_ok = false;
+                    }
+                }
+                Ok(None) => {
+                    self.goals.push("<no-assert-found>".to_string());
+                    self.syn.push("<none>".to_string());
+                }
+                Err(_) => {
+                    self.goals.push("<lift-panicked>".to_string());
+                    self.syn.push("<panicked>".to_string());
+                    self.syn_ok = false;
+                }
+            }
+        }
+    }
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+
+impl vir::vir_observer::VirObserver for AirLiftProbe {
+    fn on_krate(&mut self, krate: &vir::ast::Krate, nc: &vir::def::NameCtxt, cc: &vir::ast::CrateId) {
+        self.airlift.on_krate(krate, nc, cc);
+    }
+    fn on_havoc(&mut self, stm: &vir::sst::Stm, var: &vir::ast::VarIdent) {
+        self.airlift.on_havoc(stm, var);
+    }
+    fn on_assign(&mut self, stm: &vir::sst::Stm, var: &vir::ast::VarIdent) {
+        self.airlift.on_assign(stm, var);
+    }
+    fn on_variable_def(&mut self, stm: &vir::sst::Stm, var: &vir::ast::VarIdent) {
+        self.airlift.on_variable_def(stm, var);
+    }
+    fn on_branch_merge(&mut self, stm: &vir::sst::Stm) {
+        self.airlift.on_branch_merge(stm);
+    }
+    fn on_break_merge(&mut self, stm: &vir::sst::Stm) {
+        self.airlift.on_break_merge(stm);
+    }
+    fn on_for_loop(&mut self, stm: &vir::sst::Stm) {
+        self.airlift.on_for_loop(stm);
+    }
+    fn on_quantifier_binder(&mut self, b: &vir::ast::VarBinder<vir::ast::Typ>, exp: &vir::sst::Exp) {
+        self.airlift.on_quantifier_binder(b, exp);
+    }
+    fn on_quantifier_binder_decl(&mut self, var: &vir::ast::VarIdent) {
+        self.airlift.on_quantifier_binder_decl(var);
+    }
+    fn on_body_lowering_start(&mut self) {
+        self.airlift.on_body_lowering_start();
+    }
+    fn on_reveal_string(&mut self, lit: &std::sync::Arc<String>) {
+        self.airlift.on_reveal_string(lit);
+    }
+    fn make_assert_id(
+        &mut self,
+        kind: &vir::vir_observer::AssertIdKind,
+        index: usize,
+        parent: &Option<air::ast::AssertId>,
+    ) -> Option<air::ast::AssertId> {
+        self.airlift.make_assert_id(kind, index, parent)
+    }
+    fn on_function_lowered(&mut self) {
+        self.airlift.on_function_lowered();
+    }
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
